@@ -50,6 +50,13 @@ class Context(commands.Context):
     def session(self):
         return self.bot.session
 
+    @discord.utils.cached_property
+    def replied_reference(self):
+        ref = self.message.reference
+        if ref and isinstance(ref.resolved, discord.Message):
+            return ref.resolved.to_reference()
+        return None
+
     async def disambiguate(self, matches, entry):
         if len(matches) == 0:
             raise ValueError('No results found.')
@@ -176,7 +183,7 @@ class Context(commands.Context):
             self._db = await self.pool.acquire(timeout=timeout)
         return self._db
 
-    def acquire(self, *, timeout=None):
+    def acquire(self, *, timeout=300.0):
         """Acquires a database connection from the pool. e.g. ::
 
             async with ctx.acquire():

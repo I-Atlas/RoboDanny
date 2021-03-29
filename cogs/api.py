@@ -1,6 +1,7 @@
 from discord.ext import commands
 from .utils import checks, db, fuzzy, cache, time
 import asyncio
+import datetime
 import discord
 import re
 import zlib
@@ -16,7 +17,8 @@ CONTRIBUTORS_ROLE = 111173097888993280
 DISCORD_PY_ID     = 84319995256905728
 DISCORD_PY_GUILD  = 336642139381301249
 DISCORD_PY_PROF_ROLE = 381978395270971407
-DISCORD_PY_HELP_CHANNELS = (381965515721146390, 564950631455129636)
+DISCORD_PY_HELPER_ROLE = 558559632637952010
+DISCORD_PY_HELP_CHANNELS = (381965515721146390, 564950631455129636, 738572311107469354)
 BOT_LIST_INFO = {
     DISCORD_API_ID: {
         'channel':580184108794380298,
@@ -45,7 +47,31 @@ def in_testing(info=BOT_LIST_INFO):
             return False
     return commands.check(predicate)
 
+def is_discord_py_helper(member):
+    guild_id = member.guild.id
+    if guild_id != DISCORD_PY_GUILD:
+        return False
+
+    if member.guild_permissions.manage_roles:
+        return False
+
+    return member._roles.has(DISCORD_PY_HELPER_ROLE)
+
 def can_use_block():
+    def predicate(ctx):
+        if ctx.guild is None:
+            return False
+
+        guild_id = ctx.guild.id
+        if guild_id == DISCORD_API_ID:
+            return ctx.channel.permissions_for(ctx.author).manage_roles
+        elif guild_id == DISCORD_PY_GUILD:
+            guild_level = ctx.author.guild_permissions
+            return guild_level.manage_roles
+        return False
+    return commands.check(predicate)
+
+def can_use_tempblock():
     def predicate(ctx):
         if ctx.guild is None:
             return False
@@ -57,7 +83,8 @@ def can_use_block():
             guild_level = ctx.author.guild_permissions
             return guild_level.manage_roles or (
                 ctx.channel.id in DISCORD_PY_HELP_CHANNELS and
-                any(r.id == DISCORD_PY_PROF_ROLE for r in ctx.author.roles)
+                (ctx.author._roles.has(DISCORD_PY_PROF_ROLE) or
+                 ctx.author._roles.has(DISCORD_PY_HELPER_ROLE))
             )
         return False
     return commands.check(predicate)
@@ -149,51 +176,6 @@ class API(commands.Cog):
         if member.bot:
             role = discord.Object(id=USER_BOTS_ROLE)
             await member.add_roles(role)
-
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        channel = message.channel
-        author = message.author
-
-        if channel.id != DISCORD_PY_ID:
-            return
-
-        if author.status is discord.Status.offline:
-            fmt = f'{author.mention} has been blocked for being invisible until they change their status or for 5 minutes.'
-
-            try:
-                await channel.set_permissions(author, read_messages=False, reason='invisible block')
-                self._recently_blocked.add(author.id)
-                await channel.send(fmt)
-                msg = f'Heya. You have been automatically blocked from <#{DISCORD_PY_ID}> for 5 minutes for being ' \
-                       'invisible.\nTry chatting again in 5 minutes or when you change your status. If you\'re curious ' \
-                       'why invisible users are blocked, it is because they tend to break the client and cause them to ' \
-                       'be hard to mention. Since we want to help you usually, we expect mentions to work without ' \
-                       'headaches.\n\nSorry for the trouble.'
-                await author.send(msg)
-            except discord.HTTPException:
-                pass
-
-            await asyncio.sleep(300)
-            self._recently_blocked.discard(author.id)
-            await channel.set_permissions(author, overwrite=None, reason='invisible unblock')
-            return
-
-        m = self.issue.search(message.content)
-        if m is not None:
-            url = 'https://github.com/Rapptz/discord.py/issues/'
-            await channel.send(url + m.group('number'))
-
-    @commands.Cog.listener()
-    async def on_member_update(self, before, after):
-        if after.guild.id != DISCORD_API_ID:
-            return
-
-        if before.status is discord.Status.offline and after.status is not discord.Status.offline:
-            if after.id in self._recently_blocked:
-                self._recently_blocked.discard(after.id)
-                channel = after.guild.get_channel(DISCORD_PY_ID)
-                await channel.set_permissions(after, overwrite=None, reason='invisible unblock')
 
     def parse_object_inv(self, stream, url):
         # key: URL
@@ -302,7 +284,7 @@ class API(commands.Cog):
             return await ctx.send('Could not find anything. Sorry.')
 
         e.description = '\n'.join(f'[`{key}`]({url})' for key, url in matches)
-        await ctx.send(embed=e)
+        await ctx.send(embed=e, reference=ctx.replied_reference)
 
         if ctx.guild and ctx.guild.id in (DISCORD_API_ID, DISCORD_PY_GUILD):
             query = 'INSERT INTO rtfm (user_id) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET count = rtfm.count + 1;'
@@ -313,8 +295,8 @@ class API(commands.Cog):
             #                             日本語 category
             if ctx.channel.category_id == 490287576670928914:
                 return prefix + '-jp'
-            #                    d.py unofficial JP
-            elif ctx.guild.id == 463986890190749698:
+            #                    d.py unofficial JP   Discord Bot Portal JP
+            elif ctx.guild.id in (463986890190749698, 494911447420108820):
                 return prefix + '-jp'
         return prefix
 
@@ -382,7 +364,7 @@ class API(commands.Cog):
             output.append(f'**Top {len(records)} users**:')
 
             for rank, (user_id, count) in enumerate(records, 1):
-                user = self.bot.get_user(user_id)
+                user = self.bot.get_user(user_id) or (await self.bot.fetch_user(user_id))
                 if rank != 10:
                     output.append(f'{rank}\u20e3 {user}: {count}')
                 else:
@@ -408,6 +390,9 @@ class API(commands.Cog):
     async def block(self, ctx, *, member: discord.Member):
         """Blocks a user from your channel."""
 
+        if member.top_role >= ctx.author.top_role:
+            return
+
         reason = f'Block by {ctx.author} (ID: {ctx.author.id})'
 
         channels = self.get_block_channels(ctx.guild, ctx.channel)
@@ -422,6 +407,27 @@ class API(commands.Cog):
 
     @commands.command()
     @can_use_block()
+    async def unblock(self, ctx, *, member: discord.Member):
+        """Unblocks a user from your channel."""
+
+        if member.top_role >= ctx.author.top_role:
+            return
+
+        reason = f'Unblock by {ctx.author} (ID: {ctx.author.id})'
+
+        channels = self.get_block_channels(ctx.guild, ctx.channel)
+
+        try:
+            for channel in channels:
+                await channel.set_permissions(member, send_messages=None, add_reactions=None, reason=reason)
+        except:
+            await ctx.send('\N{THUMBS DOWN SIGN}')
+        else:
+            await ctx.send('\N{THUMBS UP SIGN}')
+
+
+    @commands.command()
+    @can_use_tempblock()
     async def tempblock(self, ctx, duration: time.FutureTime, *, member: discord.Member):
         """Temporarily blocks a user from your channel.
 
@@ -432,6 +438,13 @@ class API(commands.Cog):
         Note that times are in UTC.
         """
 
+        if member.top_role >= ctx.author.top_role:
+            return
+
+        created_at = ctx.message.created_at
+        if is_discord_py_helper(ctx.author) and duration.dt > (created_at + datetime.timedelta(minutes=60)):
+            return await ctx.send('Helpers can only block for up to an hour.')
+
         reminder = self.bot.get_cog('Reminder')
         if reminder is None:
             return await ctx.send('Sorry, this functionality is currently unavailable. Try again later?')
@@ -440,7 +453,7 @@ class API(commands.Cog):
         timer = await reminder.create_timer(duration.dt, 'tempblock', ctx.guild.id, ctx.author.id,
                                                                       ctx.channel.id, member.id,
                                                                       connection=ctx.db,
-                                                                      created=ctx.message.created_at)
+                                                                      created=created_at)
 
         reason = f'Tempblock by {ctx.author} (ID: {ctx.author.id}) until {duration.dt}'
 
@@ -466,12 +479,12 @@ class API(commands.Cog):
             # RIP x2
             return
 
-        to_unblock = guild.get_member(member_id)
+        to_unblock = await self.bot.get_or_fetch_member(guild, member_id)
         if to_unblock is None:
             # RIP x3
             return
 
-        moderator = guild.get_member(mod_id)
+        moderator = await self.bot.get_or_fetch_member(guild, mod_id)
         if moderator is None:
             try:
                 moderator = await self.bot.fetch_user(mod_id)
@@ -652,7 +665,8 @@ class API(commands.Cog):
         await role.edit(mentionable=True)
 
         # then send the message..
-        await ctx.send(f'{role.mention}: {content}'[:2000])
+        mentions = discord.AllowedMentions(roles=[role])
+        await ctx.send(f'{role.mention}: {content}'[:2000], allowed_mentions=mentions)
 
         # then make the role unmentionable
         await role.edit(mentionable=False)
@@ -685,7 +699,7 @@ class API(commands.Cog):
         for key, _, value in matches:
             paginator.add_line(f'**{key}**\n{value}')
         page = paginator.pages[0]
-        await ctx.send(page)
+        await ctx.send(page, reference=ctx.replied_reference)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
@@ -700,7 +714,8 @@ class API(commands.Cog):
         if payload.channel_id != channel_id:
             return
 
-        channel = self.bot.get_guild(payload.guild_id).get_channel(payload.channel_id)
+        guild = self.bot.get_guild(payload.guild_id)
+        channel = guild.get_channel(payload.channel_id)
         try:
             message = await channel.fetch_message(payload.message_id)
         except (AttributeError, discord.HTTPException):
@@ -710,12 +725,12 @@ class API(commands.Cog):
             return
 
         embed = message.embeds[0]
-        user = self.bot.get_user(payload.user_id)
-        if user is None or user.bot:
-            return
-
         # Already been handled.
         if embed.colour != discord.Colour.blurple():
+            return
+
+        user = await self.bot.get_or_fetch_member(guild, payload.user_id)
+        if user is None or user.bot:
             return
 
         author_id = int(embed.footer.text)
@@ -732,8 +747,9 @@ class API(commands.Cog):
             to_send = f"Your bot, <@{bot_id}>, has been rejected from {channel.guild.name}."
             colour = discord.Colour.dark_magenta()
 
+        member = await self.bot.get_or_fetch_member(guild, author_id)
         try:
-            await self.bot.get_user(author_id).send(to_send)
+            await member.send(to_send)
         except (AttributeError, discord.HTTPException):
             colour = discord.Colour.gold()
 

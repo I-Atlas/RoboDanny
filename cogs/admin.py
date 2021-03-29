@@ -419,12 +419,12 @@ class Admin(commands.Cog):
             await ctx.send(fmt)
 
     @commands.command(hidden=True)
-    async def sudo(self, ctx, channel: Optional[GlobalChannel], who: discord.User, *, command: str):
+    async def sudo(self, ctx, channel: Optional[GlobalChannel], who: Union[discord.Member, discord.User], *, command: str):
         """Run a command as another user optionally in another channel."""
         msg = copy.copy(ctx.message)
         channel = channel or ctx.channel
         msg.channel = channel
-        msg.author = channel.guild.get_member(who.id) or who
+        msg.author = who
         msg.content = ctx.prefix + command
         new_ctx = await self.bot.get_context(msg, cls=type(ctx))
         new_ctx._db = ctx._db
@@ -445,7 +445,8 @@ class Admin(commands.Cog):
     @commands.command(hidden=True)
     async def sh(self, ctx, *, command):
         """Runs a shell command."""
-        from cogs.utils.paginator import TextPages
+        from cogs.utils.paginator import TextPageSource, RoboPages
+        from discord.ext.menus import MenuError
 
         async with ctx.typing():
             stdout, stderr = await self.run_process(command)
@@ -455,10 +456,10 @@ class Admin(commands.Cog):
         else:
             text = stdout
 
+        pages = RoboPages(TextPageSource(text))
         try:
-            pages = TextPages(ctx, text)
-            await pages.paginate()
-        except Exception as e:
+            await pages.start(ctx)
+        except MenuError as e:
             await ctx.send(str(e))
 
     @commands.command(hidden=True)

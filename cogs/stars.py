@@ -1,7 +1,7 @@
-from discord.ext import commands, tasks
+from discord.ext import commands, tasks, menus
 from .utils import checks, db, cache
 from .utils.formats import plural, human_join
-from .utils.paginator import Pages
+from .utils.paginator import SimplePages
 from collections import Counter, defaultdict
 
 import discord
@@ -115,6 +115,7 @@ class Stars(commands.Cog):
         self._about_to_be_deleted = set()
 
         self._locks = weakref.WeakValueDictionary()
+        self.spoilers = re.compile(r'\|\|(.+?)\|\|')
 
     def cog_unload(self):
         self.clean_message_cache.cancel()
@@ -161,6 +162,13 @@ class Stars(commands.Cog):
         blue = int((12 * p) + (247 * (1 - p)))
         return (red << 16) + (green << 8) + blue
 
+    def is_url_spoiler(self, text, url):
+        spoilers = self.spoilers.findall(text)
+        for spoiler in spoilers:
+            if url in spoiler:
+                return True
+        return False
+
     def get_emoji_message(self, message, stars):
         emoji = self.star_emoji(stars)
 
@@ -173,13 +181,16 @@ class Stars(commands.Cog):
         embed = discord.Embed(description=message.content)
         if message.embeds:
             data = message.embeds[0]
-            if data.type == 'image':
+            if data.type == 'image' and not self.is_url_spoiler(message.content, data.url):
                 embed.set_image(url=data.url)
 
         if message.attachments:
             file = message.attachments[0]
-            if file.url.lower().endswith(('png', 'jpeg', 'jpg', 'gif', 'webp')):
+            spoiler = file.is_spoiler()
+            if not spoiler and file.url.lower().endswith(('png', 'jpeg', 'jpg', 'gif', 'webp')):
                 embed.set_image(url=file.url)
+            elif spoiler:
+                embed.add_field(name='Attachment', value=f'||[{file.filename}]({file.url})||', inline=False)
             else:
                 embed.add_field(name='Attachment', value=f'[{file.filename}]({file.url})', inline=False)
 
@@ -211,13 +222,17 @@ class Stars(commands.Cog):
         if str(payload.emoji) != '\N{WHITE MEDIUM STAR}':
             return
 
-        channel = self.bot.get_channel(payload.channel_id)
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
+        channel = guild.get_channel(payload.channel_id)
         if not isinstance(channel, discord.TextChannel):
             return
 
         method = getattr(self, f'{fmt}_message')
 
-        user = self.bot.get_user(payload.user_id)
+        user = payload.member or (await self.bot.get_or_fetch_member(guild, payload.user_id))
         if user is None or user.bot:
             return
 
@@ -236,7 +251,7 @@ class Stars(commands.Cog):
             return
 
         # the starboard channel got deleted, so let's clear it from the database.
-        async with self.bot.pool.acquire() as con:
+        async with self.bot.pool.acquire(timeout=300.0) as con:
             query = "DELETE FROM starboard WHERE id=$1;"
             await con.execute(query, channel.guild.id)
 
@@ -262,7 +277,7 @@ class Stars(commands.Cog):
 
         # at this point a message got deleted in the starboard
         # so just delete it from the database
-        async with self.bot.pool.acquire() as con:
+        async with self.bot.pool.acquire(timeout=300.0) as con:
             query = "DELETE FROM starboard_entries WHERE bot_message_id=$1;"
             await con.execute(query, payload.message_id)
 
@@ -277,7 +292,7 @@ class Stars(commands.Cog):
         if starboard.channel is None or starboard.channel.id != payload.channel_id:
             return
 
-        async with self.bot.pool.acquire() as con:
+        async with self.bot.pool.acquire(timeout=300.0) as con:
             query = "DELETE FROM starboard_entries WHERE bot_message_id=ANY($1::bigint[]);"
             await con.execute(query, list(payload.message_ids))
 
@@ -287,7 +302,7 @@ class Stars(commands.Cog):
         if channel is None or not isinstance(channel, discord.TextChannel):
             return
 
-        async with self.bot.pool.acquire() as con:
+        async with self.bot.pool.acquire(timeout=300.0) as con:
             starboard = await self.get_starboard(channel.guild.id, connection=con)
             if starboard.channel is None:
                 return
@@ -311,7 +326,7 @@ class Stars(commands.Cog):
             self._locks[guild_id] = lock = asyncio.Lock(loop=self.bot.loop)
 
         async with lock:
-            async with self.bot.pool.acquire() as con:
+            async with self.bot.pool.acquire(timeout=300.0) as con:
                 if verify:
                     config = self.bot.get_cog('Config')
                     if config:
@@ -449,7 +464,7 @@ class Stars(commands.Cog):
             self._locks[guild_id] = lock = asyncio.Lock(loop=self.bot.loop)
 
         async with lock:
-            async with self.bot.pool.acquire() as con:
+            async with self.bot.pool.acquire(timeout=300.0) as con:
                 if verify:
                     config = self.bot.get_cog('Config')
                     if config:
@@ -787,19 +802,19 @@ class Stars(commands.Cog):
         if records is None or len(records) == 0:
             return await ctx.send('No one starred this message or this is an invalid message ID.')
 
-        members = [str(ctx.guild.get_member(r[0]))
-                   for r in records
-                   if ctx.guild.get_member(r[0])]
+        records = [r[0] for r in records]
+        members = [str(member) async for member in self.bot.resolve_member_ids(ctx.guild, records)]
+
+        p = SimplePages(entries=members, per_page=20)
+        base = format(plural(len(records)), 'star')
+        if len(records) > len(members):
+            p.embed.title = f'{base} ({len(records) - len(members)} left server)'
+        else:
+            p.embed.title = base
 
         try:
-            p = Pages(ctx, entries=members, per_page=20, show_entry_count=False)
-            base = format(plural(len(records)), 'star')
-            if len(records) > len(members):
-                p.embed.title = f'{base} ({len(records) - len(members)} left server)'
-            else:
-                p.embed.title = base
-            await p.paginate()
-        except Exception as e:
+            await p.start(ctx)
+        except menus.MenuError as e:
             await ctx.send(e)
 
     @star.command(name='migrate')

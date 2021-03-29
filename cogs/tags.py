@@ -1,14 +1,21 @@
 from .utils import db, checks, formats, cache
-from .utils.paginator import Pages
+from .utils.paginator import SimplePages
 
-from discord.ext import commands
+from discord.ext import commands, menus
 import json
 import re
+import io
 import datetime
 import discord
 import asyncio
 import traceback
 import asyncpg
+import argparse
+import shlex
+
+class Arguments(argparse.ArgumentParser):
+    def error(self, message):
+        raise RuntimeError(message)
 
 class UnavailableTagCommand(commands.CheckFailure):
     def __str__(self):
@@ -26,6 +33,20 @@ def suggest_box():
             raise UnavailableTagCommand()
         return True
     return commands.check(pred)
+
+class TagPageEntry:
+    __slots__ = ('id', 'name')
+    def __init__(self, entry):
+        self.id = entry['id']
+        self.name = entry['name']
+
+    def __str__(self):
+        return f'{self.name} (ID: {self.id})'
+
+class TagPages(SimplePages):
+    def __init__(self, entries, *, per_page=12):
+        converted = [TagPageEntry(entry) for entry in entries]
+        super().__init__(converted, per_page=per_page)
 
 def can_use_box():
     def pred(ctx):
@@ -127,33 +148,13 @@ class FakeUser(discord.Object):
         return str(self.id)
 
 class TagMember(commands.Converter):
-    async def resolve_id(self, ctx, member_id):
-        member = ctx.guild.get_member(member_id)
-        if member is not None:
-            return member
-
-        try:
-            return await ctx.guild.fetch_member(member_id)
-        except discord.HTTPException:
-            return FakeUser(id=member_id)
-
     async def convert(self, ctx, argument):
-        if argument.isdigit():
-            return await self.resolve_id(ctx, int(argument))
-
-        match = re.match(r'<@!?([0-9]+)>$', argument)
-        if match is not None:
-            return await self.resolve_id(ctx, int(match.group(1)))
-
-        name, _, discrim = argument.partition('#')
-        if discrim:
-            result = discord.utils.get(ctx.guild.members, name=name, discrim=discrim)
-        else:
-            result = discord.utils.get(ctx.guild.members, name=name)
-
-        if result is None:
-            raise commands.BadArgument(f'User "{argument}" not found.')
-        return result
+        try:
+            return await commands.MemberConverter().convert(ctx, argument)
+        except commands.BadArgument as e:
+            if argument.isdigit():
+                return FakeUser(id=int(argument))
+            raise e
 
 class Tags(commands.Cog):
     """The tag related commands."""
@@ -318,7 +319,7 @@ class Tags(commands.Cog):
         except RuntimeError as e:
             return await ctx.send(e)
 
-        await ctx.send(tag['content'])
+        await ctx.send(tag['content'], reference=ctx.replied_reference)
 
         # update the usage
         query = "UPDATE tags SET uses = uses + 1 WHERE name = $1 AND (location_id=$2 OR location_id IS NULL);"
@@ -668,6 +669,52 @@ class Tags(commands.Cog):
         else:
             await ctx.send('Tag and corresponding aliases successfully deleted.')
 
+    @tag.command(aliases=['delete_id'])
+    @suggest_box()
+    async def remove_id(self, ctx, tag_id: int):
+        """Removes a tag by ID.
+
+        The tag owner can always delete their own tags. If someone requests
+        deletion and has Manage Server permissions then they can also
+        delete it.
+
+        Deleting a tag will delete all of its aliases as well.
+        """
+
+        bypass_owner_check = ctx.author.id == self.bot.owner_id or ctx.author.guild_permissions.manage_messages
+        clause = 'id=$1 AND location_id=$2'
+
+        if bypass_owner_check:
+            args = [tag_id, ctx.guild.id]
+        else:
+            args = [tag_id, ctx.guild.id, ctx.author.id]
+            clause = f'{clause} AND owner_id=$3'
+
+        query = f'DELETE FROM tag_lookup WHERE {clause} RETURNING tag_id;'
+        deleted = await ctx.db.fetchrow(query, *args)
+
+        if deleted is None:
+            await ctx.send('Could not delete tag. Either it does not exist or you do not have permissions to do so.')
+            return
+
+
+        if bypass_owner_check:
+            clause = 'id=$1 AND location_id=$2'
+            args = [deleted[0], ctx.guild.id]
+        else:
+            clause = 'id=$1 AND location_id=$2 AND owner_id=$3'
+            args = [deleted[0], ctx.guild.id, ctx.author.id]
+
+        query = f'DELETE FROM tags WHERE {clause};'
+        status = await ctx.db.execute(query, *args)
+
+        # the status returns DELETE <count>, similar to UPDATE above
+        if status[-1] == '0':
+            # this is based on the previous delete above
+            await ctx.send('Tag alias successfully deleted.')
+        else:
+            await ctx.send('Tag and corresponding aliases successfully deleted.')
+
     async def _send_alias_info(self, ctx, record):
         embed = discord.Embed(colour=discord.Colour.blurple())
 
@@ -765,7 +812,7 @@ class Tags(commands.Cog):
 
         member = member or ctx.author
 
-        query = """SELECT name
+        query = """SELECT name, id
                    FROM tag_lookup
                    WHERE location_id=$1 AND owner_id=$2
                    ORDER BY name
@@ -776,10 +823,10 @@ class Tags(commands.Cog):
 
         if rows:
             try:
-                p = Pages(ctx, entries=tuple(r[0] for r in rows))
+                p = TagPages(entries=rows)
                 p.embed.set_author(name=member.display_name, icon_url=member.avatar_url)
-                await p.paginate()
-            except Exception as e:
+                await p.start(ctx)
+            except menus.MenuError as e:
                 await ctx.send(e)
         else:
             await ctx.send(f'{member} has no tags.')
@@ -790,14 +837,61 @@ class Tags(commands.Cog):
         """An alias for tag list command."""
         await ctx.invoke(self._list, member=member)
 
+    @staticmethod
+    def _get_tag_all_arguments(args):
+        parser = Arguments(add_help=False, allow_abbrev=False)
+        parser.add_argument('--text', action='store_true')
+        if args is not None:
+            return parser.parse_args(shlex.split(args))
+        else:
+            return parser.parse_args([])
+
+    async def _tag_all_text_mode(self, ctx):
+        query = """SELECT tag_lookup.id,
+                          tag_lookup.name,
+                          tag_lookup.owner_id,
+                          tags.uses,
+                          $2 OR $3 = tag_lookup.owner_id AS "can_delete",
+                          LOWER(tag_lookup.name) <> LOWER(tags.name) AS "is_alias"
+                   FROM tag_lookup
+                   INNER JOIN tags ON tags.id = tag_lookup.tag_id
+                   WHERE tag_lookup.location_id=$1
+                   ORDER BY tags.uses DESC;
+                """
+
+        bypass_owner_check = ctx.author.id == self.bot.owner_id or ctx.author.guild_permissions.manage_messages
+        rows = await ctx.db.fetch(query, ctx.guild.id, bypass_owner_check, ctx.author.id)
+        if not rows:
+            return await ctx.send('This server has no server-specific tags.')
+
+        table = formats.TabularData()
+        table.set_columns(list(rows[0].keys()))
+        table.add_rows(list(r.values()) for r in rows)
+        fp = io.BytesIO(table.render().encode('utf-8'))
+        await ctx.send(file=discord.File(fp, 'tags.txt'))
+
     @tag.command(name='all')
     @suggest_box()
-    async def _all(self, ctx):
-        """Lists all server-specific tags for this server."""
+    async def _all(self, ctx, *, args: str = None):
+        """Lists all server-specific tags for this server.
 
-        query = """SELECT name
+        You can pass specific flags to this command to control the output:
+
+        `--text`: Dumps into a text file
+        """
+
+        try:
+            args = self._get_tag_all_arguments(args)
+        except RuntimeError as e:
+            return await ctx.send(e)
+
+        if args.text:
+            return await self._tag_all_text_mode(ctx)
+
+        query = """SELECT name, id
                    FROM tag_lookup
                    WHERE location_id=$1
+                   ORDER BY name
                 """
 
         rows = await ctx.db.fetch(query, ctx.guild.id)
@@ -805,11 +899,10 @@ class Tags(commands.Cog):
 
         if rows:
             # PSQL orders this oddly for some reason
-            entries = sorted(tuple(r[0] for r in rows))
             try:
-                p = Pages(ctx, entries=entries, per_page=20)
-                await p.paginate()
-            except Exception as e:
+                p = TagPages(entries=rows, per_page=20)
+                await p.start(ctx)
+            except menus.MenuError as e:
                 await ctx.send(e)
         else:
             await ctx.send('This server has no server-specific tags.')
@@ -852,7 +945,7 @@ class Tags(commands.Cog):
         if len(query) < 3:
             return await ctx.send('The query length must be at least three characters.')
 
-        sql = """SELECT name
+        sql = """SELECT name, id
                  FROM tag_lookup
                  WHERE location_id=$1 AND name % $2
                  ORDER BY similarity(name, $2) DESC
@@ -863,12 +956,12 @@ class Tags(commands.Cog):
 
         if results:
             try:
-                p = Pages(ctx, entries=tuple(r[0] for r in results), per_page=20)
-            except Exception as e:
+                p = TagPages(entries=results, per_page=20)
+            except menus.MenuError as e:
                 await ctx.send(e)
             else:
                 await ctx.release()
-                await p.paginate()
+                await p.start(ctx)
         else:
             await ctx.send('No tags found.')
 
@@ -885,13 +978,12 @@ class Tags(commands.Cog):
         query = "SELECT id, owner_id FROM tags WHERE location_id=$1 AND LOWER(name)=$2;"
         row = await ctx.db.fetchrow(query, ctx.guild.id, tag.lower())
         if row is None:
-            return await ctx.send(f'A tag with the name of "{tag}" does not exist.')
+            alias_query = "SELECT tag_id, owner_id FROM tag_lookup WHERE location_id = $1 and LOWER(name) = $2;"
+            row = await ctx.db.fetchrow(alias_query, ctx.guild.id, tag.lower())
+            if row is None:
+                return await ctx.send(f'A tag with the name of "{tag}" does not exist.')
 
-        try:
-            member = ctx.guild.get_member(row[1]) or await ctx.guild.fetch_member(row[1])
-        except discord.NotFound:
-            member = None
-
+        member = await self.bot.get_or_fetch_member(ctx.guild, row[1])
         if member is not None:
             return await ctx.send('Tag owner is still in server.')
 
@@ -1092,9 +1184,9 @@ class Tags(commands.Cog):
         data.sort()
 
         try:
-            p = Pages(ctx, entries=data, per_page=20)
-            await p.paginate()
-        except Exception as e:
+            p = SimplePages(entries=data, per_page=20)
+            await p.start(ctx)
+        except menus.MenuError as e:
             await ctx.send(e)
 
     @box.command(name='stats')
@@ -1172,11 +1264,11 @@ class Tags(commands.Cog):
         if rows:
             entries = [f'{name} ({uses} uses)' for name, uses in rows]
             try:
-                p = Pages(ctx, entries=entries)
+                p = SimplePages(entries=entries)
                 p.embed.set_author(name=user.display_name, icon_url=user.avatar_url)
                 p.embed.title = f'{sum(u for _, u in rows)} total uses'
-                await p.paginate()
-            except Exception as e:
+                await p.start(ctx)
+            except menus.MenuError as e:
                 await ctx.send(e)
         else:
             await ctx.send(f'{user} has no tags.')

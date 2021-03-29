@@ -1,8 +1,7 @@
-from discord.ext import commands, tasks
+from discord.ext import commands, tasks, menus
 from collections import Counter, defaultdict
 
 from .utils import checks, db, time, formats
-from .utils.paginator import CannotPaginate
 
 import pkg_resources
 import logging
@@ -91,7 +90,7 @@ class Stats(commands.Cog):
 
     def cog_unload(self):
         self.bulk_insert_loop.stop()
-        self._gateway_worker.cancel()
+        self.gateway_worker.cancel()
 
     @tasks.loop(seconds=10.0)
     async def bulk_insert_loop(self):
@@ -138,7 +137,7 @@ class Stats(commands.Cog):
     async def on_socket_response(self, msg):
         self.bot.socket_stats[msg.get('t')] += 1
 
-    @property
+    @discord.utils.cached_property
     def webhook(self):
         wh_id, wh_token = self.bot.config.stat_webhook
         hook = discord.Webhook.partial(id=wh_id, token=wh_token, adapter=discord.AsyncWebhookAdapter(self.bot.session))
@@ -203,7 +202,7 @@ class Stats(commands.Cog):
         short, _, _ = commit.message.partition('\n')
         short_sha2 = commit.hex[0:6]
         commit_tz = datetime.timezone(datetime.timedelta(minutes=commit.commit_time_offset))
-        commit_time = datetime.datetime.fromtimestamp(commit.commit_time).replace(tzinfo=commit_tz)
+        commit_time = datetime.datetime.fromtimestamp(commit.commit_time).astimezone(commit_tz)
 
         # [`hash`](url) message (offset)
         offset = time.human_timedelta(commit_time.astimezone(datetime.timezone.utc).replace(tzinfo=None), accuracy=1)
@@ -224,18 +223,13 @@ class Stats(commands.Cog):
         embed.url = 'https://discord.gg/DWEaqMy'
         embed.colour = discord.Colour.blurple()
 
-        owner = self.bot.get_user(self.bot.owner_id)
+        # To properly cache myself, I need to use the bot support server.
+        support_guild = self.bot.get_guild(182325885867786241)
+        owner = await self.bot.get_or_fetch_member(support_guild, self.bot.owner_id)
         embed.set_author(name=str(owner), icon_url=owner.avatar_url)
 
         # statistics
         total_members = 0
-        total_online = 0
-        offline = discord.Status.offline
-        for member in self.bot.get_all_members():
-            total_members += 1
-            if member.status is not offline:
-                total_online += 1
-
         total_unique = len(self.bot.users)
 
         text = 0
@@ -243,13 +237,14 @@ class Stats(commands.Cog):
         guilds = 0
         for guild in self.bot.guilds:
             guilds += 1
+            total_members += guild.member_count
             for channel in guild.channels:
                 if isinstance(channel, discord.TextChannel):
                     text += 1
                 elif isinstance(channel, discord.VoiceChannel):
                     voice += 1
 
-        embed.add_field(name='Members', value=f'{total_members} total\n{total_unique} unique\n{total_online} unique online')
+        embed.add_field(name='Members', value=f'{total_members} total\n{total_unique} unique')
         embed.add_field(name='Channels', value=f'{text + voice} total\n{text} text\n{voice} voice')
 
         memory_usage = self.process.memory_full_info().uss / 1024**2
@@ -572,14 +567,12 @@ class Stats(commands.Cog):
         e.add_field(name='Name', value=guild.name)
         e.add_field(name='ID', value=guild.id)
         e.add_field(name='Shard ID', value=guild.shard_id or 'N/A')
-        e.add_field(name='Owner', value=f'{guild.owner} (ID: {guild.owner.id})')
+        e.add_field(name='Owner', value=f'{guild.owner} (ID: {guild.owner_id})')
 
         bots = sum(m.bot for m in guild.members)
         total = guild.member_count
-        online = sum(m.status is discord.Status.online for m in guild.members)
         e.add_field(name='Members', value=str(total))
         e.add_field(name='Bots', value=f'{bots} ({bots/total:.2%})')
-        e.add_field(name='Online', value=f'{online} ({online/total:.2%})')
 
         if guild.icon:
             e.set_thumbnail(url=guild.icon_url)
@@ -611,7 +604,7 @@ class Stats(commands.Cog):
             return
 
         error = error.original
-        if isinstance(error, (discord.Forbidden, discord.NotFound, CannotPaginate)):
+        if isinstance(error, (discord.Forbidden, discord.NotFound, menus.MenuError)):
             return
 
         e = discord.Embed(title='Command Error', colour=0xcc3366)
@@ -643,7 +636,7 @@ class Stats(commands.Cog):
 
         emoji = attributes.get(record.levelname, '\N{CROSS MARK}')
         dt = datetime.datetime.utcfromtimestamp(record.created)
-        msg = f'{emoji} `[{dt:%Y-%m-%d %H:%M:%S}] {record.message}`'
+        msg = textwrap.shorten(f'{emoji} `[{dt:%Y-%m-%d %H:%M:%S}] {record.message}`', width=1990)
         await self.webhook.send(msg, username='Gateway', avatar_url='https://i.imgur.com/4PnCKB3.png')
 
     @commands.command(hidden=True)
@@ -779,16 +772,16 @@ class Stats(commands.Cog):
             # Shard WS closed
             # Shard Task failure
             # Shard Task complete (no failure)
-            if shard._task.done():
-                exc = shard._task.exception()
+            if shard.is_closed():
+                badge = '<:offline:316856575501402112>'
+                issues += 1
+            elif shard._parent._task.done():
+                exc = shard._parent._task.exception()
                 if exc is not None:
                     badge = '\N{FIRE}'
                     issues += 1
                 else:
                     badge = '\U0001f504'
-            elif not shard.ws.open:
-                badge = '<:offline:316856575501402112>'
-                issues += 1
 
             if badge is None:
                 badge = '<:online:316856575413321728>'

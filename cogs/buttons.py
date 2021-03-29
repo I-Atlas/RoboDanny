@@ -1,7 +1,7 @@
 import asyncio
-from discord.ext import commands
+from discord.ext import commands, menus
 import discord
-from .utils.paginator import Pages
+from .utils.paginator import RoboPages
 from lxml import etree
 import random
 import logging
@@ -27,13 +27,10 @@ def can_use_spoiler():
 
 SPOILER_EMOJI_ID = 430469957042831371
 
-class UrbanDictionaryPages(Pages):
+class UrbanDictionaryPageSource(menus.ListPageSource):
     BRACKETED = re.compile(r'(\[(.+?)\])')
-    def __init__(self, ctx, data):
-        super().__init__(ctx, entries=data, per_page=1)
-
-    def get_page(self, page):
-        return self.entries[page - 1]
+    def __init__(self, data):
+        super().__init__(entries=data, per_page=1)
 
     def cleanup_definition(self, definition, *, regex=BRACKETED):
         def repl(m):
@@ -45,32 +42,31 @@ class UrbanDictionaryPages(Pages):
             return ret[0:2000] + ' [...]'
         return ret
 
-    def prepare_embed(self, entry, page, *, first=False):
-        if self.maximum_pages > 1:
-            title = f'{entry["word"]}: {page} out of {self.maximum_pages}'
-        else:
-            title = entry['word']
-
-        self.embed = e = discord.Embed(colour=0xE86222, title=title, url=entry['permalink'])
-        e.set_footer(text=f'by {entry["author"]}')
-        e.description = self.cleanup_definition(entry['definition'])
+    async def format_page(self, menu, entry):
+        maximum = self.get_max_pages()
+        title = f'{entry["word"]}: {menu.current_page + 1} out of {maximum}' if maximum else entry['word']
+        embed = discord.Embed(title=title, colour=0xE86222, url=entry['permalink'])
+        embed.set_footer(text=f'by {entry["author"]}')
+        embed.description = self.cleanup_definition(entry['definition'])
 
         try:
             up, down = entry['thumbs_up'], entry['thumbs_down']
         except KeyError:
             pass
         else:
-            e.add_field(name='Votes', value=f'\N{THUMBS UP SIGN} {up} \N{THUMBS DOWN SIGN} {down}', inline=False)
+            embed.add_field(name='Votes', value=f'\N{THUMBS UP SIGN} {up} \N{THUMBS DOWN SIGN} {down}', inline=False)
 
         try:
             date = discord.utils.parse_time(entry['written_on'][0:-1])
         except (ValueError, KeyError):
             pass
         else:
-            e.timestamp = date
+            embed.timestamp = date
+
+        return embed
 
 class RedditMediaURL:
-    VALID_PATH = re.compile(r'/r/[A-Za-z0-9]+/comments/[A-Za-z0-9]+(?:/.+)?')
+    VALID_PATH = re.compile(r'/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9]+(?:/.+)?')
 
     def __init__(self, url):
         self.url = url
@@ -253,7 +249,7 @@ class Buttons(commands.Cog):
     @commands.command()
     @commands.is_owner()
     async def pm(self, ctx, user_id: int, *, content: str):
-        user = self.bot.get_user(user_id)
+        user = self.bot.get_user(user_id) or (await self.bot.fetch_user(user_id))
 
         fmt = content + '\n\n*This is a DM sent because you had previously requested feedback or I found a bug' \
                         ' in a command you used, I do not monitor this DM.*'
@@ -359,11 +355,11 @@ class Buttons(commands.Cog):
         if payload.emoji.id != SPOILER_EMOJI_ID:
             return
 
-        user = self.bot.get_user(payload.user_id)
-        if not user or user.bot:
+        if self._spoiler_cooldown.is_rate_limited(payload.message_id, payload.user_id):
             return
 
-        if self._spoiler_cooldown.is_rate_limited(payload.message_id, payload.user_id):
+        user = self.bot.get_user(payload.user_id) or (await self.bot.fetch_user(payload.user_id))
+        if not user or user.bot:
             return
 
         cache = await self.get_spoiler_cache(payload.channel_id, payload.message_id)
@@ -438,10 +434,10 @@ class Buttons(commands.Cog):
             if not data:
                 return await ctx.send('No results found, sorry.')
 
+        pages = RoboPages(UrbanDictionaryPageSource(data))
         try:
-            pages = UrbanDictionaryPages(ctx, data)
-            await pages.paginate()
-        except Exception as e:
+            await pages.start(ctx)
+        except menus.MenuError as e:
             await ctx.send(e)
 
 def setup(bot):
